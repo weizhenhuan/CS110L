@@ -1,11 +1,13 @@
 mod request;
 mod response;
 
+use std::io::ErrorKind;
 use std::sync::Arc;
 use clap::Parser;
 use rand::{Rng, SeedableRng};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::stream::StreamExt;
+use tokio::sync::RwLock;
 
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
 /// provide a fancy way to automatically construct a command-line argument parser.
@@ -57,6 +59,8 @@ struct ProxyState {
     max_requests_per_minute: usize,
     /// Addresses of servers that we are proxying to
     upstream_addresses: Vec<String>,
+    /// Status of upstream servers, true for alive, false for dead, and number of alive servers, wrapped in a Rwlock
+    upstream_status: RwLock<(usize, Vec<bool>)>,
 }
 
 #[tokio::main]
@@ -87,11 +91,13 @@ async fn main() {
     log::info!("Listening for requests on {}", options.bind);
 
     // Handle incoming connections
+    let upstream_len = options.upstream.len();
     let state = ProxyState {
         upstream_addresses: options.upstream,
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
+        upstream_status: RwLock::new((upstream_len, vec![true; upstream_len])),
     };
 
     let state_arc = Arc::new(state);
@@ -110,16 +116,36 @@ async fn main() {
         }
     }
 }
-
-async fn connect_to_upstream(state: Arc<ProxyState>) -> Result<TcpStream, std::io::Error> {
+async fn pick_random_alive_upstream(state: &Arc<ProxyState>) -> Option<usize> {
     let mut rng = rand::rngs::StdRng::from_entropy();
-    let upstream_idx = rng.gen_range(0, state.upstream_addresses.len());
-    let upstream_ip = &state.upstream_addresses[upstream_idx];
-    TcpStream::connect(upstream_ip).await.or_else(|err| {
-        log::error!("Failed to connect to upstream {}: {}", upstream_ip, err);
-        Err(err)
-    })
-    // TODO: implement failover (milestone 3)
+    let upstream_status = state.upstream_status.read().await;
+    if upstream_status.0 <= 0 {
+        return None
+    } else {
+        loop {
+            let upstream_idx = rng.gen_range(0, state.upstream_addresses.len());
+            if upstream_status.1[upstream_idx] {
+                return Some(upstream_idx);
+            }
+        }
+    }
+}
+
+async fn connect_to_upstream(state: &Arc<ProxyState>) -> Result<TcpStream, std::io::Error> {
+    loop {
+        if let Some(upstream_idx) = pick_random_alive_upstream(state).await {
+            let upstream_ip = &state.upstream_addresses[upstream_idx];
+            if let Ok(stream) = TcpStream::connect(upstream_ip).await {
+                return Ok(stream);
+            } else {
+                let mut status_mut = state.upstream_status.write().await;
+                status_mut.0 -= 1;
+                status_mut.1[upstream_idx] = false;
+            }
+        } else {
+            return Err(std::io::Error::new(ErrorKind::Other, "the upstream has all down"));
+        }
+    }
 }
 
 async fn send_response(client_conn: &mut TcpStream, response: &http::Response<Vec<u8>>) {
@@ -136,7 +162,7 @@ async fn handle_connection(mut client_conn: TcpStream, state: Arc<ProxyState>) {
     log::info!("Connection received from {}", client_ip);
 
     // Open a connection to a random destination server
-    let mut upstream_conn = match connect_to_upstream(state).await {
+    let mut upstream_conn = match connect_to_upstream(&state).await {
         Ok(stream) => stream,
         Err(_error) => {
             let response = response::make_http_error(http::StatusCode::BAD_GATEWAY);
